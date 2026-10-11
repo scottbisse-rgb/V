@@ -94,6 +94,34 @@ Pick the k best **distinct source experts**, scoring each by its best copy, then
   it reproduces the source's top-2 exactly instead of its top-1, and lets copies specialise from the first step.
   The seed tool's own "ROUTER OFFSETS" note says no per-copy constant can do this. A routing rule can.
 
+## Disk space and the auto-pruner (3090 box, done 2026-10-11 ~21:00–21:08 BST, on Scott's order)
+
+**Freed 5.3 GB (18.1 → 23.4 GB free)**, with nothing removed that isn't backed up elsewhere:
+
+* 3.6 GiB: 8,882 RPV16-era files under `/workspace`, deleted by `free_space.py` only where the file's sha256 equals
+  its entry in `ARCHIVE_MANIFEST_20261011.sha256` (the verified GDrive/KnowHow/laptop archive of this box). The 3
+  files that did not match were kept. 16B paths, dot-folders, the manifest and onstart files are never candidates.
+* 0.9 GB: `/var/tmp/hfpub/stage`, the staging copy of the scrubbed RPV16 logs. The same tar.gz (92,696,548 bytes) is
+  on the public HF repo `MarxistLeninist/AGILLM-GB10-1PF`. Its small receipts were kept.
+* 0.8 GB: `/root/.cache/huggingface/xet`, an upload chunk cache left from the RPV16 era.
+* **Kept:** `/workspace/seed_src_8b_29877` (7.9 GB), the exact 8B checkpoint the 16B was seeded from. No off-host
+  copy of that exact step was found (the nearest 8B HF export is a different step), so it is kept until Scott decides.
+
+**Auto-pruner: `prune_guard.py` v2 is on (`--apply`)**, as loop pid started 20:07 UTC and in `/workspace/onstart.sh`
+so it restarts with the box (backups: `prune_guard.py.v1`, `onstart.sh.pre-pruner-v2-20261011T200658Z`). Every 10 min
+it removes only:
+
+1. stale backup snapshots (over 90 min, backup lock free) that are not the last copy of a checkpoint, or are older
+   than both valid live generations;
+2. the uploader's HF xet cache above 2 GiB, while no backup runs;
+3. as a last resort, `ckpt.old`, but only if free disk is below what the next save needs (ckpt size + 2 GiB), no save
+   is in progress, `ckpt` is valid and newer, and the off-host backup is under 12 h old. The trainer deletes
+   `ckpt.old` at every save anyway; this only does it early so the save fits.
+
+It never touches `ckpt`, `ckpt.new`, `ckpt.good`, data or logs. The trainer already rotates its own checkpoints
+and deletes consumed data pools. `prune_guard.py self-test` covers every rule on fixtures and passes on the box.
+Status: `/workspace/agillm16b/prune_guard_status.json`; log: `prune_guard.out`.
+
 ## Other observations (not acted on)
 
 * **GPU power cap.** The 3090 runs at a 200 W limit (default 350 W, max 400 W), and "SW Power Cap" is active.
@@ -115,5 +143,7 @@ Pick the k best **distinct source experts**, scoring each by its best copy, then
 | `route_groups_16b.json` | the 16B's map (sha `393be3fa`) |
 | `route_ab_eval.py` | the offline CPU A/B (`--compare group` or `--compare top1`, `--ckpt-dir` for any checkpoint) |
 | `results/` | raw A/B outputs |
+| `prune_guard.py` | the 16B box auto-pruner v2 (deployed as `/workspace/agillm16b/code/prune_guard.py`) |
+| `free_space.py` | the manifest-verified cleanup used to free the RPV16-era files |
 
 On the box: `/workspace/claude_16b_eval/` (patched trainer sha `e00b59af`, logs, smoke runs, about 2 MB).
