@@ -1,0 +1,115 @@
+--- /workspace/agillm16b/code/bintf2_16b.py	2026-10-11 17:33:54.266032208 +0000
++++ /workspace/claude_16b_eval/bintf2_16b_grouproute.py	2026-10-11 19:45:06.652232632 +0000
+@@ -2648,6 +2648,41 @@
+             and mask.dtype == torch.float16 and tuple(mask.shape) == (Bm, cfg.n_head, L, L) and L % 16 == 0)
+ 
+ 
++def _group_topk(probs, k, grp):
++    """Top-k over DISTINCT source experts of an upcycled MoE (--route-groups).
++
++    probs (N, E) router probabilities; grp (E,) long, the source expert each expert was copied from. A group's score
++    is its best copy's probability; the k best groups are taken, then the best copy inside each. Returns
++    (top_p, top_i) like probs.topk(k): top_i[:, 0] is the overall argmax and the rows are in descending probability.
++    With exact copies this is the source model's top-k (same experts up to copy, same renormalised gates), where a
++    plain topk puts every slot on copies of the token's first expert (they tie): the source's TOP-1 output."""
++    N, E = probs.shape
++    best = probs.new_full((N, int(grp.max()) + 1), -1.0).scatter_reduce(1, grp.expand(N, E), probs, 'amax')
++    tg = best.topk(k, dim=-1).indices
++    top_i = torch.stack([probs.masked_fill(grp[None, :] != tg[:, j:j + 1], -1.0).argmax(-1) for j in range(k)], -1)
++    return probs.gather(1, top_i), top_i
++
++
++def apply_route_groups(model, path):
++    """--route-groups FILE: every layer's source-expert map (see _group_topk). Returns the file's sha256[:12]."""
++    if not path:
++        return None
++    raw = open(path, 'rb').read()
++    nets = json.loads(raw)['nets']
++    if len(nets) != len(model.nets):
++        raise SystemExit(f'--route-groups {path}: {len(nets)} nets, the model has {len(model.nets)}')
++    for b, (net, layers) in enumerate(zip(model.nets, nets)):
++        if len(layers) != len(net.layers):
++            raise SystemExit(f'--route-groups {path}: net {b} has {len(layers)} layers, the model {len(net.layers)}')
++        for l, (layer, g) in enumerate(zip(net.layers, layers)):
++            E = layer.router.weight.shape[0]
++            if len(g) != E or min(g) < 0 or len(set(g)) < model.cfg.topk:
++                raise SystemExit(f'--route-groups {path}: net {b} layer {l}: {len(g)} ids for {E} experts, '
++                                 f'{len(set(g))} groups for top-{model.cfg.topk}')
++            layer.grp = torch.tensor(g, dtype=torch.long, device=layer.router.weight.device)
++    return hashlib.sha256(raw).hexdigest()[:12]
++
++
+ class Layer(nn.Module):
+     def __init__(self, cfg):
+         super().__init__()
+@@ -2720,7 +2755,11 @@
+             again = (_Again(lambda: FUSED.norm_fwd(xc.view(-1, D), wc)[0], 2), _Again())
+         if cfg.n_exp:
+             probs = _RouterLin.apply(m, self.router.weight, *again[:1]).float().softmax(-1)
+-            top_p, top_i = probs.topk(cfg.topk, dim=-1)
++            grp = getattr(self, 'grp', None)  # --route-groups
++            if grp is None:
++                top_p, top_i = probs.topk(cfg.topk, dim=-1)
++            else:
++                top_p, top_i = _group_topk(probs, cfg.topk, grp if grp.device == probs.device else grp.to(probs.device))
+             top_p = top_p / top_p.sum(-1, keepdim=True)
+             # Switch-style load balancing: share of first choices times mean router probability
+             load = F.one_hot(top_i[:, 0], cfg.n_exp).float().mean(0)
+@@ -5147,6 +5186,13 @@
+                   f'{st["ckpt_format"]["dither_seed"]}); second moments and AdamW moments from bf16', flush=True)
+     else:
+         model.init_signs()
++    rg = apply_route_groups(model, a.route_groups)
++    if rg:
++        print(f'routing: top-{cfg.topk} over distinct source experts (--route-groups {a.route_groups}, sha256 {rg})',
++              flush=True)
++    elif ck and (st.get('args') or {}).get('route_groups'):
++        print(f'WARNING: this checkpoint was trained with --route-groups {st["args"]["route_groups"]}; resuming '
++              'without it routes by plain top-k, which changes what the model computes', flush=True)
+     # ParScale, built in and on (see ParAdapter): every net's add-on from the checkpoint's side files, else fresh
+     frozen = bool(a.parscale_freeze_backbone)
+     if frozen and not ck:
+@@ -5695,6 +5741,8 @@
+     set_vocab(cfg.vocab)
+     model = Model(cfg)
+     means = load_ckpt(model, None, ck, None if a.latest else 'read')
++    if apply_route_groups(model, a.route_groups):
++        print(f'routing: top-{cfg.topk} over distinct source experts (--route-groups {a.route_groups})')
+     total, binary = model.counts()
+     print(f'{ck}: {describe(cfg, total, binary)}; steps {st["steps"]}, {st["seen"] / 1e9:.4f}B {unit()} seen'
+           + ('; read from the running means of the latents' if means else ''))
+@@ -5812,6 +5860,8 @@
+     model = Model(cfg)
+     if load_ckpt(model, None, ck, None if a.latest else 'read'):
+         print('read from the running means of the latents (--latest: the latest latents)')
++    if apply_route_groups(model, a.route_groups):
++        print(f'routing: top-{cfg.topk} over distinct source experts (--route-groups {a.route_groups})')
+     Pe = attach_parscale(model, ps_source(ck, a.run, cfg), a.parscale)  # D9: else run/parscale_last
+     vraw = np.fromfile(os.path.join(a.run, 'val.bin'), dtype=id_dtype())
+     vlen = min(a.val_len or cfg.ctx, st['args'].get('window', 4096))  # a row stays inside one window of text
+@@ -5926,6 +5976,9 @@
+     model_args(sp)
+     decode_args(sp)
+     sp.add_argument('--run', required=True, help='directory for checkpoints, logs and the data cache')
++    sp.add_argument('--route-groups', default='',
++                    help='JSON source-expert map of an upcycled MoE (make_route_groups.py): route each token to '
++                         'the top-k DISTINCT source experts, the best copy inside each. Give it on every resume')
+     sp.add_argument('--resume', action='store_true', help='continue from the checkpoint in --run if there is one')
+     sp.add_argument('--require-resume-checkpoint', action='store_true',
+                     help='refuse and pause instead of starting from zero when the resume checkpoint is missing')
+@@ -6066,6 +6119,7 @@
+ 
+     sp = sub.add_parser('generate', help='sample all decoding modes from the checkpoint in --run')
+     sp.add_argument('--run', required=True)
++    sp.add_argument('--route-groups', default='', help='as train --route-groups (the same file)')
+     sp.add_argument('--parscale', type=int, default=PS_P,
+                     help='ParScale streams (at most as many as were trained; 1 = the plain model)')
+     sp.add_argument('--latest', action='store_true',
+@@ -6087,6 +6141,7 @@
+ 
+     sp = sub.add_parser('eval', help='score the checkpoint in --run on its validation windows at any row length')
+     sp.add_argument('--run', required=True)
++    sp.add_argument('--route-groups', default='', help='as train --route-groups (the same file)')
+     sp.add_argument('--parscale', type=int, default=PS_P,
+                     help='also score with this many ParScale streams merged (at most as many as were trained)')
+     sp.add_argument('--val-len', type=int, default=0, help='ids per row (0 = ctx; at most one window)')
